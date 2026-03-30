@@ -41,8 +41,9 @@ func main() {
 	mux.HandleFunc("/api/lookup", handleLookupFact)
 	mux.HandleFunc("/api/config", handleConfig)
 
-	// Serve static frontend
-	fs := http.FileServer(http.Dir("../frontend"))
+	// Serve static frontend (./frontend in Docker, ../frontend locally)
+	frontendDir := getEnv("FRONTEND_DIR", "../frontend")
+	fs := http.FileServer(http.Dir(frontendDir))
 	mux.Handle("/", fs)
 
 	// CORS wrapper
