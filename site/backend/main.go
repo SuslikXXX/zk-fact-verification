@@ -6,58 +6,120 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
+
+	"github.com/joho/godotenv"
 )
 
+var cfg AppConfig
+
+type AppConfig struct {
+	Port                string
+	EthereumRPC         string
+	FactRegistryAddress string
+	IssuerRegistryAddress string
+	VerifierID          string
+	VerifierIDHash      string
+}
+
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	_ = godotenv.Load()
+
+	cfg = AppConfig{
+		Port:                getEnv("PORT", "8080"),
+		EthereumRPC:         getEnv("ETHEREUM_RPC_URL", "http://127.0.0.1:8545"),
+		FactRegistryAddress: getEnv("FACT_REGISTRY_ADDRESS", ""),
+		IssuerRegistryAddress: getEnv("ISSUER_REGISTRY_ADDRESS", ""),
+		VerifierID:          getEnv("VERIFIER_ID", "did:web:shop.example.com"),
+		VerifierIDHash:      getEnv("VERIFIER_ID_HASH", ""),
 	}
 
-	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
+	mux := http.NewServeMux()
 
-	http.HandleFunc("/api/request", handleCreateRequest)
-	http.HandleFunc("/api/status", handleCheckStatus)
+	// API endpoints
+	mux.HandleFunc("/api/health", handleHealth)
+	mux.HandleFunc("/api/lookup", handleLookupFact)
+	mux.HandleFunc("/api/config", handleConfig)
 
 	// Serve static frontend
-	http.Handle("/", http.FileServer(http.Dir("../frontend")))
+	fs := http.FileServer(http.Dir("../frontend"))
+	mux.Handle("/", fs)
 
-	fmt.Printf("Verifier backend listening on :%s\n", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	// CORS wrapper
+	handler := corsMiddleware(mux)
+
+	fmt.Printf("Verifier backend on :%s\n", cfg.Port)
+	fmt.Printf("  RPC: %s\n", cfg.EthereumRPC)
+	fmt.Printf("  FactRegistry: %s\n", cfg.FactRegistryAddress)
+	log.Fatal(http.ListenAndServe(":"+cfg.Port, handler))
 }
 
-func handleCreateRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	// TODO: generate verification_request.json and return it
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "created",
-		"message": "Verification request created (stub)",
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+func handleConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]string{
+		"verifier_id":           cfg.VerifierID,
+		"verifier_id_hash":      cfg.VerifierIDHash,
+		"fact_registry_address": cfg.FactRegistryAddress,
+		"ethereum_rpc":          cfg.EthereumRPC,
 	})
 }
 
-func handleCheckStatus(w http.ResponseWriter, r *http.Request) {
+func handleLookupFact(w http.ResponseWriter, r *http.Request) {
 	subjectTag := r.URL.Query().Get("subject_tag")
 	factTypeHash := r.URL.Query().Get("fact_type_hash")
 	verifierIDHash := r.URL.Query().Get("verifier_id_hash")
 
-	if subjectTag == "" || factTypeHash == "" || verifierIDHash == "" {
-		http.Error(w, "Missing query params: subject_tag, fact_type_hash, verifier_id_hash", http.StatusBadRequest)
+	if subjectTag == "" || factTypeHash == "" {
+		http.Error(w, `{"error":"subject_tag and fact_type_hash required"}`, http.StatusBadRequest)
+		return
+	}
+	if verifierIDHash == "" {
+		verifierIDHash = cfg.VerifierIDHash
+	}
+
+	if cfg.FactRegistryAddress == "" {
+		writeJSON(w, map[string]interface{}{
+			"error": "FACT_REGISTRY_ADDRESS not configured",
+		})
 		return
 	}
 
-	// TODO: call FactRegistry.isFactValid() via ethclient
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"subject_tag":     subjectTag,
-		"fact_type_hash":  factTypeHash,
-		"verifier_id_hash": verifierIDHash,
-		"fact_valid":      false,
-		"message":         "On-chain lookup not yet implemented",
+	fact, err := lookupFactOnChain(cfg.EthereumRPC, cfg.FactRegistryAddress, verifierIDHash, subjectTag, factTypeHash)
+	if err != nil {
+		writeJSON(w, map[string]interface{}{
+			"exists": false,
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, fact)
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(204)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
+}
+
+func writeJSON(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func getEnv(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return strings.TrimSpace(val)
+	}
+	return fallback
 }
